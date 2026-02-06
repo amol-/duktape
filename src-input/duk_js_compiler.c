@@ -87,7 +87,7 @@
  * because they overlap in control flow, some could be eliminated.
  */
 #define DUK__COMPILE_ENTRY_SLOTS         8
-#define DUK__FUNCTION_INIT_REQUIRE_SLOTS 16
+#define DUK__FUNCTION_INIT_REQUIRE_SLOTS 19
 #define DUK__FUNCTION_BODY_REQUIRE_SLOTS 16
 #define DUK__PARSE_STATEMENTS_SLOTS      16
 #define DUK__PARSE_EXPR_SLOTS            16
@@ -190,6 +190,12 @@ DUK_LOCAL_DECL duk_regconst_t duk__ivalue_totempconst(duk_compiler_ctx *comp_ctx
 DUK_LOCAL_DECL duk_regconst_t duk__lookup_active_register_binding(duk_compiler_ctx *comp_ctx);
 DUK_LOCAL_DECL duk_bool_t duk__lookup_lhs(duk_compiler_ctx *ctx, duk_regconst_t *out_reg_varbind, duk_regconst_t *out_rc_varname);
 
+/* block scope handling */
+DUK_LOCAL_DECL void duk__blockscope_reset(duk_compiler_ctx *comp_ctx, duk_bool_t reset_scopes);
+DUK_LOCAL_DECL duk_int_t duk__blockscope_enter(duk_compiler_ctx *comp_ctx, duk_bool_t enable, duk_regconst_t *out_rc_bindings);
+DUK_LOCAL_DECL void duk__blockscope_exit(duk_compiler_ctx *comp_ctx, duk_int_t block_id);
+DUK_LOCAL_DECL duk_bool_t duk__blockscope_add_binding(duk_compiler_ctx *comp_ctx, duk_hstring *h_name, duk_bool_t is_const);
+
 /* label handling */
 DUK_LOCAL_DECL void duk__add_label(duk_compiler_ctx *comp_ctx, duk_hstring *h_label, duk_int_t pc_label, duk_int_t label_id);
 DUK_LOCAL_DECL void duk__update_label_flags(duk_compiler_ctx *comp_ctx, duk_int_t label_id, duk_small_uint_t flags);
@@ -249,11 +255,16 @@ DUK_LOCAL_DECL void duk__nud_object_literal(duk_compiler_ctx *comp_ctx, duk_ival
 
 /* statement parsing */
 DUK_LOCAL_DECL void duk__parse_var_decl(duk_compiler_ctx *comp_ctx,
+                                       duk_ivalue *res,
+                                       duk_small_uint_t decl_kind,
+                                       duk_small_uint_t expr_flags,
+                                       duk_bool_t *out_has_initializer,
+                                       duk_regconst_t *out_reg_varbind,
+                                       duk_regconst_t *out_rc_varname);
+DUK_LOCAL_DECL void duk__parse_var_stmt(duk_compiler_ctx *comp_ctx,
                                         duk_ivalue *res,
-                                        duk_small_uint_t expr_flags,
-                                        duk_regconst_t *out_reg_varbind,
-                                        duk_regconst_t *out_rc_varname);
-DUK_LOCAL_DECL void duk__parse_var_stmt(duk_compiler_ctx *comp_ctx, duk_ivalue *res, duk_small_uint_t expr_flags);
+                                        duk_small_uint_t decl_kind,
+                                        duk_small_uint_t expr_flags);
 DUK_LOCAL_DECL void duk__parse_for_stmt(duk_compiler_ctx *comp_ctx, duk_ivalue *res, duk_int_t pc_label_site);
 DUK_LOCAL_DECL void duk__parse_switch_stmt(duk_compiler_ctx *comp_ctx, duk_ivalue *res, duk_int_t pc_label_site);
 DUK_LOCAL_DECL void duk__parse_if_stmt(duk_compiler_ctx *comp_ctx, duk_ivalue *res);
@@ -570,6 +581,9 @@ DUK_LOCAL void duk__init_func_valstack_slots(duk_compiler_ctx *comp_ctx) {
 	func->h_labelinfos = NULL;
 	func->h_argnames = NULL;
 	func->h_varmap = NULL;
+	func->h_blockscopes = NULL;
+	func->h_blockscope_stack = NULL;
+	func->h_blockscope_restore = NULL;
 #endif
 
 	duk_require_stack(thr, DUK__FUNCTION_INIT_REQUIRE_SLOTS);
@@ -613,6 +627,21 @@ DUK_LOCAL void duk__init_func_valstack_slots(duk_compiler_ctx *comp_ctx) {
 	func->varmap_idx = entry_top + 7;
 	func->h_varmap = DUK_GET_HOBJECT_POSIDX(thr, entry_top + 7);
 	DUK_ASSERT(func->h_varmap != NULL);
+
+	duk_push_bare_array(thr);
+	func->blockscopes_idx = entry_top + 8;
+	func->h_blockscopes = DUK_GET_HOBJECT_POSIDX(thr, entry_top + 8);
+	DUK_ASSERT(func->h_blockscopes != NULL);
+
+	duk_push_bare_array(thr);
+	func->blockscope_stack_idx = entry_top + 9;
+	func->h_blockscope_stack = DUK_GET_HOBJECT_POSIDX(thr, entry_top + 9);
+	DUK_ASSERT(func->h_blockscope_stack != NULL);
+
+	duk_push_bare_array(thr);
+	func->blockscope_restore_idx = entry_top + 10;
+	func->h_blockscope_restore = DUK_GET_HOBJECT_POSIDX(thr, entry_top + 10);
+	DUK_ASSERT(func->h_blockscope_restore != NULL);
 }
 
 /* reset function state (prepare for pass 2) */
@@ -2705,6 +2734,263 @@ DUK_LOCAL duk_bool_t duk__lookup_lhs(duk_compiler_ctx *comp_ctx, duk_regconst_t 
 		*out_rc_varname = rc_varname;
 		return 0;
 	}
+}
+
+/*
+ *  Block scope handling.
+ */
+
+DUK_LOCAL duk_bool_t duk__blockscope_has_binding(duk_compiler_ctx *comp_ctx, duk_idx_t bindings_idx, duk_hstring *h_name) {
+	duk_hthread *thr = comp_ctx->thr;
+	duk_uarridx_t i;
+	duk_uarridx_t n;
+
+	n = (duk_uarridx_t) duk_get_length(thr, bindings_idx);
+	for (i = 0; i < n; i += 2) {
+		duk_get_prop_index(thr, bindings_idx, i);
+		if (duk_known_hstring_m1(thr) == h_name) {
+			duk_pop(thr);
+			return 1;
+		}
+		duk_pop(thr);
+	}
+	return 0;
+}
+
+DUK_LOCAL duk_bool_t duk__decls_have_name(duk_compiler_ctx *comp_ctx, duk_hstring *h_name) {
+	duk_hthread *thr = comp_ctx->thr;
+	duk_uarridx_t i;
+	duk_uarridx_t n;
+
+	n = (duk_uarridx_t) duk_get_length(thr, comp_ctx->curr_func.decls_idx);
+	for (i = 0; i < n; i += 2) {
+		duk_get_prop_index(thr, comp_ctx->curr_func.decls_idx, i);
+		if (duk_known_hstring_m1(thr) == h_name) {
+			duk_pop(thr);
+			return 1;
+		}
+		duk_pop(thr);
+	}
+	return 0;
+}
+
+DUK_LOCAL duk_bool_t duk__blockscope_root_has_binding(duk_compiler_ctx *comp_ctx, duk_hstring *h_name) {
+	duk_hthread *thr = comp_ctx->thr;
+	duk_uarridx_t stack_len;
+	duk_uarridx_t block_id;
+	duk_bool_t ret;
+
+	if (!comp_ctx->curr_func.is_function && !comp_ctx->curr_func.is_eval) {
+		return 0;
+	}
+
+	stack_len = (duk_uarridx_t) duk_get_length(thr, comp_ctx->curr_func.blockscope_stack_idx);
+	if (stack_len == 0) {
+		return 0;
+	}
+
+	duk_get_prop_index(thr, comp_ctx->curr_func.blockscope_stack_idx, 0);
+	block_id = (duk_uarridx_t) duk_get_uint(thr, -1);
+	duk_pop(thr);
+
+	duk_get_prop_index(thr, comp_ctx->curr_func.blockscopes_idx, block_id);
+	if (!duk_is_object(thr, -1)) {
+		duk_pop(thr);
+		return 0;
+	}
+	ret = duk__blockscope_has_binding(comp_ctx, duk_get_top_index(thr), h_name);
+	duk_pop(thr);
+	return ret;
+}
+
+DUK_LOCAL void duk__blockscope_reset(duk_compiler_ctx *comp_ctx, duk_bool_t reset_scopes) {
+	duk_hthread *thr = comp_ctx->thr;
+
+	comp_ctx->curr_func.block_next = 0;
+	duk_set_length(thr, comp_ctx->curr_func.blockscope_stack_idx, 0);
+	duk_set_length(thr, comp_ctx->curr_func.blockscope_restore_idx, 0);
+	if (reset_scopes) {
+		duk_set_length(thr, comp_ctx->curr_func.blockscopes_idx, 0);
+	}
+}
+
+DUK_LOCAL duk_int_t duk__blockscope_enter(duk_compiler_ctx *comp_ctx, duk_bool_t enable, duk_regconst_t *out_rc_bindings) {
+	duk_hthread *thr = comp_ctx->thr;
+	duk_uarridx_t stack_len;
+	duk_uarridx_t bindings_len;
+	duk_uarridx_t i;
+	duk_uint_t block_id;
+	duk_idx_t bindings_idx;
+	duk_idx_t restore_idx;
+	duk_regconst_t rc_bindings;
+
+	if (out_rc_bindings != NULL) {
+		*out_rc_bindings = -1;
+	}
+	if (!enable) {
+		return -1;
+	}
+
+	block_id = comp_ctx->curr_func.block_next++;
+
+	stack_len = (duk_uarridx_t) duk_get_length(thr, comp_ctx->curr_func.blockscope_stack_idx);
+	duk_push_uint(thr, block_id);
+	duk_put_prop_index(thr, comp_ctx->curr_func.blockscope_stack_idx, stack_len);
+
+	if (comp_ctx->curr_func.in_scanning) {
+		duk_push_bare_array(thr);
+		duk_put_prop_index(thr, comp_ctx->curr_func.blockscopes_idx, (duk_uarridx_t) block_id);
+		duk_push_undefined(thr);
+		duk_put_prop_index(thr, comp_ctx->curr_func.blockscope_restore_idx, stack_len);
+		return (duk_int_t) block_id;
+	}
+
+	duk_get_prop_index(thr, comp_ctx->curr_func.blockscopes_idx, (duk_uarridx_t) block_id);
+	if (!duk_is_object(thr, -1)) {
+		duk_pop(thr);
+		duk_push_undefined(thr);
+		duk_put_prop_index(thr, comp_ctx->curr_func.blockscope_restore_idx, stack_len);
+		return (duk_int_t) block_id;
+	}
+
+	bindings_idx = duk_get_top_index(thr);
+	bindings_len = (duk_uarridx_t) duk_get_length(thr, bindings_idx);
+	if (bindings_len == 0) {
+		duk_pop(thr);
+		duk_push_undefined(thr);
+		duk_put_prop_index(thr, comp_ctx->curr_func.blockscope_restore_idx, stack_len);
+		return (duk_int_t) block_id;
+	}
+
+	duk_dup_top_unsafe(thr);
+	rc_bindings = duk__getconst(comp_ctx);
+	duk__emit_a_bc(comp_ctx, DUK_OP_NEWLEXENV, 0, rc_bindings);
+	if (out_rc_bindings != NULL) {
+		*out_rc_bindings = rc_bindings;
+	}
+
+	duk_push_bare_array(thr);
+	restore_idx = duk_get_top_index(thr);
+	for (i = 0; i < bindings_len; i += 2) {
+		duk_get_prop_index(thr, bindings_idx, i);
+		duk_dup_top_unsafe(thr);
+		duk_get_prop(thr, comp_ctx->curr_func.varmap_idx);
+		duk_put_prop_index(thr, restore_idx, i + 1);
+		duk_dup_top_unsafe(thr);
+		duk_push_null(thr);
+		duk_put_prop(thr, comp_ctx->curr_func.varmap_idx);
+		duk_put_prop_index(thr, restore_idx, i);
+	}
+	duk_put_prop_index(thr, comp_ctx->curr_func.blockscope_restore_idx, stack_len);
+	duk_pop(thr);
+
+	return (duk_int_t) block_id;
+}
+
+DUK_LOCAL void duk__blockscope_exit(duk_compiler_ctx *comp_ctx, duk_int_t block_id) {
+	duk_hthread *thr = comp_ctx->thr;
+	duk_uarridx_t stack_len;
+	duk_uarridx_t i;
+	duk_uarridx_t n;
+	duk_idx_t restore_idx;
+
+	if (block_id < 0) {
+		return;
+	}
+
+	stack_len = (duk_uarridx_t) duk_get_length(thr, comp_ctx->curr_func.blockscope_stack_idx);
+	if (stack_len == 0) {
+		return;
+	}
+
+	duk_get_prop_index(thr, comp_ctx->curr_func.blockscope_restore_idx, stack_len - 1);
+	if (!duk_is_undefined(thr, -1)) {
+		if (!comp_ctx->curr_func.in_scanning) {
+			duk__emit_op_only(comp_ctx, DUK_OP_POPLEXENV);
+		}
+		restore_idx = duk_get_top_index(thr);
+		n = (duk_uarridx_t) duk_get_length(thr, restore_idx);
+		for (i = 0; i < n; i += 2) {
+			duk_get_prop_index(thr, restore_idx, i);
+			duk_get_prop_index(thr, restore_idx, i + 1);
+			if (duk_is_undefined(thr, -1)) {
+				duk_pop_known(thr);
+				duk_del_prop(thr, comp_ctx->curr_func.varmap_idx);
+			} else {
+				duk_put_prop(thr, comp_ctx->curr_func.varmap_idx);
+			}
+		}
+	}
+	duk_pop(thr);
+
+	duk_set_length(thr, comp_ctx->curr_func.blockscope_stack_idx, stack_len - 1);
+	duk_set_length(thr, comp_ctx->curr_func.blockscope_restore_idx, stack_len - 1);
+}
+
+DUK_LOCAL duk_bool_t duk__blockscope_add_binding(duk_compiler_ctx *comp_ctx, duk_hstring *h_name, duk_bool_t is_const) {
+	duk_hthread *thr = comp_ctx->thr;
+	duk_uarridx_t stack_len;
+	duk_uarridx_t block_id;
+	duk_uarridx_t n;
+	duk_idx_t bindings_idx;
+
+	stack_len = (duk_uarridx_t) duk_get_length(thr, comp_ctx->curr_func.blockscope_stack_idx);
+	if (stack_len == 0) {
+		return 0;
+	}
+
+	if (!comp_ctx->curr_func.in_scanning) {
+		return 1;
+	}
+
+	duk_get_prop_index(thr, comp_ctx->curr_func.blockscope_stack_idx, stack_len - 1);
+	block_id = (duk_uarridx_t) duk_get_uint(thr, -1);
+	duk_pop(thr);
+
+	duk_get_prop_index(thr, comp_ctx->curr_func.blockscopes_idx, block_id);
+	if (!duk_is_object(thr, -1)) {
+		duk_pop(thr);
+		return 1;
+	}
+
+	bindings_idx = duk_get_top_index(thr);
+	if (duk__blockscope_has_binding(comp_ctx, bindings_idx, h_name)) {
+		duk_pop(thr);
+		goto syntax_error;
+	}
+
+	if (stack_len == 1 && (comp_ctx->curr_func.is_function || comp_ctx->curr_func.is_eval) &&
+	    duk__decls_have_name(comp_ctx, h_name)) {
+		duk_pop(thr);
+		goto syntax_error;
+	}
+	if (stack_len == 1 && comp_ctx->curr_func.is_function) {
+		duk_uarridx_t i;
+		duk_uarridx_t n;
+
+		n = (duk_uarridx_t) duk_get_length(thr, comp_ctx->curr_func.argnames_idx);
+		for (i = 0; i < n; i++) {
+			duk_get_prop_index(thr, comp_ctx->curr_func.argnames_idx, i);
+			if (duk_known_hstring_m1(thr) == h_name) {
+				duk_pop(thr);
+				duk_pop(thr);
+				goto syntax_error;
+			}
+			duk_pop(thr);
+		}
+	}
+
+	n = (duk_uarridx_t) duk_get_length(thr, bindings_idx);
+	duk_push_hstring(thr, h_name);
+	duk_put_prop_index(thr, bindings_idx, n);
+	duk_push_uint(thr, is_const ? DUK_BC_BLOCK_FLAG_CONST : 0);
+	duk_put_prop_index(thr, bindings_idx, n + 1);
+	duk_pop(thr);
+	return 1;
+
+syntax_error:
+	DUK_ERROR_SYNTAX(thr, DUK_STR_INVALID_VAR_DECLARATION);
+	DUK_WO_NORETURN(return 0;);
 }
 
 /*
@@ -5194,9 +5480,13 @@ DUK_LOCAL void duk__exprtop_toplain_ignore(duk_compiler_ctx *comp_ctx, duk_ivalu
 #define DUK__STILL_PROLOGUE         (1 << 3) /* statement does not terminate directive prologue */
 #define DUK__IS_TERMINAL            (1 << 4) /* statement is guaranteed to be terminal (control doesn't flow to next statement) */
 
-/* Parse a single variable declaration (e.g. "i" or "i=10").  A leading 'var'
- * has already been eaten.  These is no return value in 'res', it is used only
- * as a temporary.
+#define DUK__VARDECL_KIND_VAR   0
+#define DUK__VARDECL_KIND_LET   1
+#define DUK__VARDECL_KIND_CONST 2
+
+/* Parse a single variable declaration (e.g. "i" or "i=10").  A leading
+ * 'var', 'let', or 'const' has already been eaten.  These is no return
+ * value in 'res', it is used only as a temporary.
  *
  * When called from 'for-in' statement parser, the initializer expression must
  * not allow the 'in' token.  The caller supply additional expression parsing
@@ -5214,15 +5504,22 @@ DUK_LOCAL void duk__exprtop_toplain_ignore(duk_compiler_ctx *comp_ctx, duk_ivalu
 
 DUK_LOCAL void duk__parse_var_decl(duk_compiler_ctx *comp_ctx,
                                    duk_ivalue *res,
+                                   duk_small_uint_t decl_kind,
                                    duk_small_uint_t expr_flags,
+                                   duk_bool_t *out_has_initializer,
                                    duk_regconst_t *out_reg_varbind,
                                    duk_regconst_t *out_rc_varname) {
 	duk_hthread *thr = comp_ctx->thr;
 	duk_hstring *h_varname;
 	duk_regconst_t reg_varbind;
 	duk_regconst_t rc_varname;
+	duk_bool_t has_initializer;
 
-	/* assume 'var' has been eaten */
+	/* assume 'var', 'let', or 'const' has been eaten */
+	has_initializer = 0;
+	if (out_has_initializer != NULL) {
+		*out_has_initializer = 0;
+	}
 
 	/* Note: Identifier rejects reserved words */
 	if (comp_ctx->curr_token.t != DUK_TOK_IDENTIFIER) {
@@ -5237,9 +5534,20 @@ DUK_LOCAL void duk__parse_var_decl(duk_compiler_ctx *comp_ctx,
 		goto syntax_error;
 	}
 
+	if (decl_kind != DUK__VARDECL_KIND_VAR) {
+		if (!duk__blockscope_add_binding(comp_ctx, h_varname, decl_kind == DUK__VARDECL_KIND_CONST)) {
+			decl_kind = DUK__VARDECL_KIND_VAR;
+		}
+	}
+
 	/* register declarations in first pass */
-	if (comp_ctx->curr_func.in_scanning) {
+	if (comp_ctx->curr_func.in_scanning && decl_kind == DUK__VARDECL_KIND_VAR) {
 		duk_uarridx_t n;
+
+		if (duk__blockscope_root_has_binding(comp_ctx, h_varname)) {
+			goto syntax_error;
+		}
+
 		DUK_DDD(DUK_DDDPRINT("register variable declaration %!O in pass 1", (duk_heaphdr *) h_varname));
 		n = (duk_uarridx_t) duk_get_length(thr, comp_ctx->curr_func.decls_idx);
 		duk_push_hstring(thr, h_varname);
@@ -5257,6 +5565,7 @@ DUK_LOCAL void duk__parse_var_decl(duk_compiler_ctx *comp_ctx,
 	duk__advance(comp_ctx); /* eat identifier */
 
 	if (comp_ctx->curr_token.t == DUK_TOK_EQUALSIGN) {
+		has_initializer = 1;
 		duk__advance(comp_ctx);
 
 		DUK_DDD(DUK_DDDPRINT("vardecl, assign to '%!O' -> reg_varbind=%ld, rc_varname=%ld",
@@ -5282,6 +5591,9 @@ DUK_LOCAL void duk__parse_var_decl(duk_compiler_ctx *comp_ctx,
 
 	duk_pop(thr); /* pop varname */
 
+	if (out_has_initializer != NULL) {
+		*out_has_initializer = has_initializer;
+	}
 	*out_rc_varname = rc_varname;
 	*out_reg_varbind = reg_varbind;
 
@@ -5292,15 +5604,18 @@ syntax_error:
 	DUK_WO_NORETURN(return;);
 }
 
-DUK_LOCAL void duk__parse_var_stmt(duk_compiler_ctx *comp_ctx, duk_ivalue *res, duk_small_uint_t expr_flags) {
+DUK_LOCAL void duk__parse_var_stmt(duk_compiler_ctx *comp_ctx,
+                                   duk_ivalue *res,
+                                   duk_small_uint_t decl_kind,
+                                   duk_small_uint_t expr_flags) {
 	duk_regconst_t reg_varbind;
 	duk_regconst_t rc_varname;
 
-	duk__advance(comp_ctx); /* eat 'var' */
+	duk__advance(comp_ctx); /* eat 'var'/'let'/'const' */
 
 	for (;;) {
 		/* rc_varname and reg_varbind are ignored here */
-		duk__parse_var_decl(comp_ctx, res, 0 | expr_flags, &reg_varbind, &rc_varname);
+		duk__parse_var_decl(comp_ctx, res, decl_kind, 0 | expr_flags, NULL, &reg_varbind, &rc_varname);
 
 		if (comp_ctx->curr_token.t != DUK_TOK_COMMA) {
 			break;
@@ -5314,6 +5629,9 @@ DUK_LOCAL void duk__parse_for_stmt(duk_compiler_ctx *comp_ctx, duk_ivalue *res, 
 	duk_int_t pc_v34_lhs; /* start variant 3/4 left-hand-side code (L1 in doc/compiler.rst example) */
 	duk_regconst_t temp_reset; /* knock back "next temp" to this whenever possible */
 	duk_regconst_t reg_temps; /* preallocated temporaries (2) for variants 3 and 4 */
+	duk_int_t loop_block_id = -1;
+	duk_regconst_t rc_loop_bindings = -1;
+	duk_bool_t loop_has_lexenv = 0;
 
 	DUK_DDD(DUK_DDDPRINT("start parsing a for/for-in statement"));
 
@@ -5351,16 +5669,39 @@ DUK_LOCAL void duk__parse_for_stmt(duk_compiler_ctx *comp_ctx, duk_ivalue *res, 
 	 * (it will also emit the ENDLABEL).
 	 */
 
-	if (comp_ctx->curr_token.t == DUK_TOK_VAR) {
+	if (comp_ctx->curr_token.t == DUK_TOK_VAR ||
+	    comp_ctx->curr_token.t == DUK_TOK_LET ||
+	    comp_ctx->curr_token.t == DUK_TOK_CONST) {
 		/*
 		 *  Variant 2 or 4
 		 */
 
+		duk_small_uint_t decl_kind;
 		duk_regconst_t reg_varbind; /* variable binding register if register-bound (otherwise < 0) */
 		duk_regconst_t rc_varname; /* variable name reg/const, if variable not register-bound */
+		duk_bool_t has_initializer;
 
-		duk__advance(comp_ctx); /* eat 'var' */
-		duk__parse_var_decl(comp_ctx, res, DUK__EXPR_FLAG_REJECT_IN, &reg_varbind, &rc_varname);
+		if (comp_ctx->curr_token.t == DUK_TOK_VAR) {
+			decl_kind = DUK__VARDECL_KIND_VAR;
+		} else if (comp_ctx->curr_token.t == DUK_TOK_LET) {
+			decl_kind = DUK__VARDECL_KIND_LET;
+		} else {
+			decl_kind = DUK__VARDECL_KIND_CONST;
+		}
+
+		if (decl_kind != DUK__VARDECL_KIND_VAR) {
+			loop_block_id = duk__blockscope_enter(comp_ctx, 1, &rc_loop_bindings);
+			loop_has_lexenv = (rc_loop_bindings != (duk_regconst_t) -1);
+		}
+
+		duk__advance(comp_ctx); /* eat 'var'/'let'/'const' */
+		duk__parse_var_decl(comp_ctx,
+		                    res,
+		                    decl_kind,
+		                    DUK__EXPR_FLAG_REJECT_IN,
+		                    &has_initializer,
+		                    &reg_varbind,
+		                    &rc_varname);
 		DUK__SETTEMP(comp_ctx, temp_reset);
 
 		if (comp_ctx->curr_token.t == DUK_TOK_IN) {
@@ -5383,6 +5724,9 @@ DUK_LOCAL void duk__parse_for_stmt(duk_compiler_ctx *comp_ctx, duk_ivalue *res, 
 
 			DUK_DDD(DUK_DDDPRINT(
 			    "detected for variant 2: for (var VariableDeclarationNoIn; Expression_opt; Expression_opt) Statement"));
+			if (decl_kind == DUK__VARDECL_KIND_CONST && !has_initializer) {
+				goto syntax_error;
+			}
 			for (;;) {
 				/* more initializers */
 				if (comp_ctx->curr_token.t != DUK_TOK_COMMA) {
@@ -5391,7 +5735,16 @@ DUK_LOCAL void duk__parse_for_stmt(duk_compiler_ctx *comp_ctx, duk_ivalue *res, 
 				DUK_DDD(DUK_DDDPRINT("variant 2 has another variable initializer"));
 
 				duk__advance(comp_ctx); /* eat comma */
-				duk__parse_var_decl(comp_ctx, res, DUK__EXPR_FLAG_REJECT_IN, &reg_varbind, &rc_varname);
+				duk__parse_var_decl(comp_ctx,
+				                    res,
+				                    decl_kind,
+				                    DUK__EXPR_FLAG_REJECT_IN,
+				                    &has_initializer,
+				                    &reg_varbind,
+				                    &rc_varname);
+				if (decl_kind == DUK__VARDECL_KIND_CONST && !has_initializer) {
+					goto syntax_error;
+				}
 			}
 			goto parse_1_or_2;
 		}
@@ -5510,11 +5863,18 @@ parse_1_or_2:
 		duk__advance_expect(comp_ctx, DUK_TOK_SEMICOLON);
 
 		pc_l2 = duk__get_current_pc(comp_ctx);
+		if (loop_has_lexenv) {
+			duk__emit_a_bc(comp_ctx, DUK_OP_CLONELEXENV, 0, rc_loop_bindings);
+		}
 		duk__exprtop(comp_ctx, res, DUK__BP_FOR_EXPR | DUK__EXPR_FLAG_ALLOW_EMPTY /*rbp_flags*/); /* Expression_opt */
 		if (duk__expr_is_empty(comp_ctx)) {
 			/* no need to coerce */
 			expr_c_empty = 1;
 			/* JUMP L1 omitted */
+			if (loop_has_lexenv) {
+				expr_c_empty = 0;
+				duk__emit_jump(comp_ctx, pc_l1);
+			}
 		} else {
 			duk__ivalue_toplain_ignore(comp_ctx, res);
 			expr_c_empty = 0;
@@ -5620,13 +5980,22 @@ parse_3_or_4:
 		duk__parse_stmt(comp_ctx, res, 0 /*allow_source_elem*/);
 		/* temp reset is not necessary after duk__parse_stmt(), which already does it */
 
+		if (loop_has_lexenv) {
+			pc_l4 = duk__get_current_pc(comp_ctx);
+			duk__emit_a_bc(comp_ctx,
+			               DUK_OP_CLONELEXENV,
+			               DUK_BC_CLONELEXENV_FLAG_RESET_CONST,
+			               rc_loop_bindings);
+		} else {
+			pc_l4 = duk__get_current_pc(comp_ctx);
+		}
+
 		/* NEXTENUM needs a jump slot right after the main opcode.
 		 * We need the code emitter to reserve the slot: if there's
 		 * target shuffling, the target shuffle opcodes must happen
 		 * after the jump slot (for NEXTENUM the shuffle opcodes are
 		 * not needed if the enum is finished).
 		 */
-		pc_l4 = duk__get_current_pc(comp_ctx);
 		duk__emit_b_c(comp_ctx,
 		              DUK_OP_NEXTENUM | DUK__EMIT_FLAG_B_IS_TARGET | DUK__EMIT_FLAG_RESERVE_JUMPSLOT,
 		              reg_temps + 0,
@@ -5668,6 +6037,7 @@ parse_3_or_4:
 
 finished:
 	DUK_DDD(DUK_DDDPRINT("end parsing a for/for-in statement"));
+	duk__blockscope_exit(comp_ctx, loop_block_id);
 	return;
 
 syntax_error:
@@ -5684,6 +6054,7 @@ DUK_LOCAL void duk__parse_switch_stmt(duk_compiler_ctx *comp_ctx, duk_ivalue *re
 	duk_int_t pc_prevcase = -1;
 	duk_int_t pc_prevstmt = -1;
 	duk_int_t pc_default = -1; /* -1 == not set, -2 == pending (next statement list) */
+	duk_int_t block_id;
 
 	/* Note: negative pc values are ignored when patching jumps, so no explicit checks needed */
 
@@ -5718,6 +6089,8 @@ DUK_LOCAL void duk__parse_switch_stmt(duk_compiler_ctx *comp_ctx, duk_ivalue *re
 	duk__advance_expect(comp_ctx, DUK_TOK_LCURLY);
 
 	DUK_DDD(DUK_DDDPRINT("switch value in register %ld", (long) rc_switch));
+
+	block_id = duk__blockscope_enter(comp_ctx, 1, NULL);
 
 	temp_at_loop = DUK__GETTEMP(comp_ctx);
 
@@ -5857,6 +6230,8 @@ DUK_LOCAL void duk__parse_switch_stmt(duk_compiler_ctx *comp_ctx, duk_ivalue *re
 
 	/* continue jump not patched, an INVALID opcode remains there */
 	duk__patch_jump_here(comp_ctx, pc_label_site + 1); /* break jump */
+
+	duk__blockscope_exit(comp_ctx, block_id);
 
 	/* Note: 'fast' breaks will jump to pc_label_site + 1, which will
 	 * then jump here.  The double jump will be eliminated by a
@@ -6611,13 +6986,19 @@ retry_parse:
 	}
 	case DUK_TOK_CONST: {
 		DUK_DDD(DUK_DDDPRINT("constant declaration statement"));
-		duk__parse_var_stmt(comp_ctx, res, DUK__EXPR_FLAG_REQUIRE_INIT /*expr_flags*/);
+		duk__parse_var_stmt(comp_ctx, res, DUK__VARDECL_KIND_CONST, DUK__EXPR_FLAG_REQUIRE_INIT /*expr_flags*/);
+		stmt_flags = DUK__HAS_TERM;
+		break;
+	}
+	case DUK_TOK_LET: {
+		DUK_DDD(DUK_DDDPRINT("let declaration statement"));
+		duk__parse_var_stmt(comp_ctx, res, DUK__VARDECL_KIND_LET, 0 /*expr_flags*/);
 		stmt_flags = DUK__HAS_TERM;
 		break;
 	}
 	case DUK_TOK_VAR: {
 		DUK_DDD(DUK_DDDPRINT("variable declaration statement"));
-		duk__parse_var_stmt(comp_ctx, res, 0 /*expr_flags*/);
+		duk__parse_var_stmt(comp_ctx, res, DUK__VARDECL_KIND_VAR, 0 /*expr_flags*/);
 		stmt_flags = DUK__HAS_TERM;
 		break;
 	}
@@ -6973,6 +7354,7 @@ DUK_LOCAL void duk__parse_stmts(duk_compiler_ctx *comp_ctx,
 	duk_hthread *thr = comp_ctx->thr;
 	duk_ivalue res_alloc;
 	duk_ivalue *res = &res_alloc;
+	duk_int_t block_id;
 
 	/* Setup state.  Initial ivalue is 'undefined'. */
 
@@ -6990,6 +7372,8 @@ DUK_LOCAL void duk__parse_stmts(duk_compiler_ctx *comp_ctx,
 	res->x2.valstack_idx = res->x1.valstack_idx + 1;
 	duk_push_undefined(thr);
 	duk_push_undefined(thr);
+
+	block_id = duk__blockscope_enter(comp_ctx, !expect_eof || comp_ctx->curr_func.is_eval, NULL);
 
 	/* Parse statements until a closing token (EOF or '}') is found. */
 
@@ -7026,6 +7410,7 @@ DUK_LOCAL void duk__parse_stmts(duk_compiler_ctx *comp_ctx,
 	if (regexp_after) {
 		comp_ctx->curr_func.allow_regexp_in_adv = 1;
 	}
+	duk__blockscope_exit(comp_ctx, block_id);
 	duk__advance(comp_ctx);
 
 	/* Tear down state. */
@@ -7452,6 +7837,8 @@ DUK_LOCAL void duk__parse_func_body(duk_compiler_ctx *comp_ctx,
 	func->max_line = 0;
 #endif
 
+	duk__blockscope_reset(comp_ctx, 1);
+
 	/* duk__parse_stmts() expects curr_tok to be set; parse in "allow
 	 * regexp literal" mode with current strictness.
 	 */
@@ -7533,6 +7920,8 @@ DUK_LOCAL void duk__parse_func_body(duk_compiler_ctx *comp_ctx,
 		func->temp_next = temp_first;
 		func->stmt_next = 0;
 		func->label_next = 0;
+
+		duk__blockscope_reset(comp_ctx, 0);
 
 		/* XXX: init or assert catch depth etc -- all values */
 		func->id_access_arguments = 0;

@@ -1596,6 +1596,9 @@ slow_path:
 					break;
 				}
 			}
+			if (advtok == DUK__ADVTOK(0, DUK_TOK_IDENTIFIER) && str == DUK_HTHREAD_STRING_LET(lex_ctx->thr)) {
+				advtok = DUK__ADVTOK(0, DUK_TOK_LET);
+			}
 		}
 	} else if (DUK__ISDIGIT(x) || (x == DUK_ASC_PERIOD)) {
 		/* Note: decimal number may start with a period, but must be followed by a digit */

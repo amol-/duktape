@@ -186,6 +186,7 @@ DUK_LOCAL duk_bool_t duk__prop_defown_write_new_slot(duk_hthread *thr,
 		DUK_ASSERT((DUK_DEFPROP_WEC & 0x07U) == DUK_DEFPROP_WEC);
 
 		new_attrs = (duk_uint8_t) ((defprop_flags & (defprop_flags >> DUK_DEFPROP_HAVE_SHIFT_COUNT)) & DUK_DEFPROP_WEC);
+		new_attrs |= (duk_uint8_t) (defprop_flags & DUK_DEFPROP_CONST);
 		*attr_slot = new_attrs;
 		if (defprop_flags & DUK_DEFPROP_HAVE_VALUE) {
 			duk_tval *tv_src = duk_require_tval(thr, idx_desc);
@@ -223,7 +224,7 @@ DUK_LOCAL duk_bool_t duk__prop_defown_update_convert_to_accessor(duk_hthread *th
 	}
 
 	have_shifted &= DUK_DEFPROP_EC; /* Restrict HAVE flags to EC. */
-	attrs &= DUK_PROPDESC_FLAGS_EC; /* Keep EC, zero rest. */
+	attrs &= (DUK_PROPDESC_FLAGS_EC | DUK_PROPDESC_FLAG_CONST); /* Keep EC and const, zero rest. */
 	attrs &= ~((duk_uint8_t) have_shifted); /* Zero anything provided. */
 	attrs |= (duk_uint8_t) (defprop_flags & have_shifted); /* Set anything provided. */
 	attrs |= DUK_PROPDESC_FLAG_ACCESSOR;
@@ -258,7 +259,7 @@ DUK_LOCAL duk_bool_t duk__prop_defown_update_convert_to_data(duk_hthread *thr,
 	}
 
 	have_shifted &= DUK_DEFPROP_WEC; /* Restrict HAVE flags to WEC. */
-	attrs &= DUK_PROPDESC_FLAGS_EC; /* Keep EC, zero rest. */
+	attrs &= (DUK_PROPDESC_FLAGS_EC | DUK_PROPDESC_FLAG_CONST); /* Keep EC and const, zero rest. */
 	attrs &= ~((duk_uint8_t) have_shifted); /* Zero anything provided. */
 	attrs |= (duk_uint8_t) (defprop_flags & have_shifted); /* Set anything provided. */
 	*attr_slot = attrs;

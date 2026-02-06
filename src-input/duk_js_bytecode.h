@@ -397,9 +397,9 @@ typedef duk_uint32_t duk_instr_t;
 #define DUK_OP_GETPROPC_CR_UNUSED 209
 #define DUK_OP_GETPROPC_RC        210
 #define DUK_OP_GETPROPC_CC_UNUSED 211
-#define DUK_OP_UNUSED212          212
-#define DUK_OP_UNUSED213          213
-#define DUK_OP_UNUSED214          214
+#define DUK_OP_NEWLEXENV          212
+#define DUK_OP_POPLEXENV          213
+#define DUK_OP_CLONELEXENV        214
 #define DUK_OP_UNUSED215          215
 #define DUK_OP_UNUSED216          216
 #define DUK_OP_UNUSED217          217
@@ -451,6 +451,12 @@ typedef duk_uint32_t duk_instr_t;
 #define DUK_BC_TRYCATCH_FLAG_HAVE_FINALLY  (1U << 1)
 #define DUK_BC_TRYCATCH_FLAG_CATCH_BINDING (1U << 2)
 #define DUK_BC_TRYCATCH_FLAG_WITH_BINDING  (1U << 3)
+
+/* Block binding flags for DUK_OP_NEWLEXENV/DUK_OP_CLONELEXENV. */
+#define DUK_BC_BLOCK_FLAG_CONST (1U << 0)
+
+/* CLONELEXENV flags (A field). */
+#define DUK_BC_CLONELEXENV_FLAG_RESET_CONST (1U << 0)
 
 /* DUK_OP_DECLVAR flags in A; bottom bits are reserved for propdesc flags
  * (DUK_PROPDESC_FLAG_XXX).

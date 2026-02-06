@@ -515,7 +515,7 @@ DUK_INTERNAL void duk_xdef_prop(duk_hthread *thr, duk_idx_t obj_idx, duk_small_u
 	duk_tval *tv_key;
 
 	DUK_ASSERT_API_ENTRY(thr);
-	DUK_ASSERT((desc_flags & DUK_PROPDESC_FLAGS_WEC) == desc_flags);
+	DUK_ASSERT((desc_flags & (DUK_PROPDESC_FLAGS_WEC | DUK_PROPDESC_FLAG_CONST)) == desc_flags);
 
 	obj = duk_require_hobject(thr, obj_idx);
 	DUK_ASSERT(obj != NULL);

@@ -200,6 +200,7 @@
 #define DUK_PROPDESC_FLAG_CONFIGURABLE (1U << 2) /* E5 Section 8.6.1 */
 #define DUK_PROPDESC_FLAG_ACCESSOR     (1U << 3) /* accessor */
 #define DUK_PROPDESC_FLAG_VIRTUAL      (1U << 4) /* property is virtual: never stored (used by e.g. buffer virtual properties) */
+#define DUK_PROPDESC_FLAG_CONST        (1U << 5) /* internal: const binding */
 #define DUK_PROPDESC_FLAGS_MASK \
 	(DUK_PROPDESC_FLAG_WRITABLE | DUK_PROPDESC_FLAG_ENUMERABLE | DUK_PROPDESC_FLAG_CONFIGURABLE | DUK_PROPDESC_FLAG_ACCESSOR)
 
@@ -207,6 +208,9 @@
  * flags but are not stored in object properties.
  */
 #define DUK_PROPDESC_FLAG_NO_OVERWRITE (1U << 4) /* internal define property: skip write silently if exists */
+
+/* Internal defprop flag for const bindings. */
+#define DUK_DEFPROP_CONST DUK_DEFPROP_RESERVED5
 
 /* Convenience defines for property attributes. */
 #define DUK_PROPDESC_FLAGS_NONE 0

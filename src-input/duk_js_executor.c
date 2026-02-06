@@ -4599,6 +4599,149 @@ restart_execution:
 			DUK__REPLACE_TOP_A_BREAK();
 		}
 
+		case DUK_OP_NEWLEXENV: {
+			duk_activation *act;
+			duk_hdecenv *new_env;
+			duk_tval *tv1;
+			duk_hobject *h_bindings;
+			duk_uarridx_t i;
+			duk_uarridx_t n;
+			duk_idx_t env_idx;
+			duk_uint_t binding_flags;
+			duk_uint_t prop_flags;
+			duk_hobject *prev_env;
+
+			act = thr->callstack_curr;
+			DUK_ASSERT(act != NULL);
+
+			if (act->lex_env == NULL) {
+				DUK_ASSERT(act->var_env == NULL);
+				DUK_DDD(DUK_DDDPRINT("delayed environment initialization"));
+				duk_js_init_activation_environment_records_delayed(thr, act);
+				DUK_ASSERT(act == thr->callstack_curr);
+			}
+			DUK_ASSERT(act->lex_env != NULL);
+
+			tv1 = DUK__CONSTP_BC(ins);
+			DUK_ASSERT(DUK_TVAL_IS_OBJECT(tv1));
+			h_bindings = DUK_TVAL_GET_OBJECT(tv1);
+			DUK_ASSERT(h_bindings != NULL);
+
+			new_env = duk_hdecenv_alloc(thr, DUK_HOBJECT_FLAG_EXTENSIBLE | DUK_HEAPHDR_HTYPE_AS_FLAGS(DUK_HTYPE_DECENV));
+			DUK_ASSERT(new_env != NULL);
+			duk_push_hobject(thr, (duk_hobject *) new_env);
+			env_idx = duk_get_top_index(thr);
+
+			duk_push_hobject(thr, h_bindings);
+			n = (duk_uarridx_t) duk_get_length(thr, -1);
+			for (i = 0; i < n; i += 2) {
+				duk_get_prop_index(thr, -1, i);
+				duk_get_prop_index(thr, -2, i + 1);
+				binding_flags = (duk_uint_t) duk_get_int(thr, -1);
+				duk_pop_known(thr);
+				if (binding_flags & DUK_BC_BLOCK_FLAG_CONST) {
+					prop_flags = DUK_PROPDESC_FLAG_ENUMERABLE | DUK_PROPDESC_FLAG_CONST;
+				} else {
+					prop_flags = DUK_PROPDESC_FLAG_WRITABLE | DUK_PROPDESC_FLAG_ENUMERABLE;
+				}
+				duk_push_undefined(thr);
+				DUK_TVAL_SET_UNUSED(DUK_GET_TVAL_NEGIDX(thr, -1));
+				duk_xdef_prop(thr, env_idx, prop_flags);
+			}
+			duk_pop_known(thr);
+
+			prev_env = act->lex_env;
+			duk_hobject_set_proto_raw(thr->heap, (duk_hobject *) new_env, prev_env);
+			DUK_HOBJECT_INCREF_ALLOWNULL(thr, prev_env);
+			act->lex_env = (duk_hobject *) new_env;
+			DUK_HOBJECT_INCREF(thr, (duk_hobject *) new_env);
+			DUK_HOBJECT_DECREF_ALLOWNULL(thr, prev_env);
+
+			duk_pop_known(thr);
+			break;
+		}
+
+		case DUK_OP_POPLEXENV: {
+			duk_activation *act;
+			duk_hobject *prev_env;
+
+			act = thr->callstack_curr;
+			DUK_ASSERT(act != NULL);
+			prev_env = act->lex_env;
+			DUK_ASSERT(prev_env != NULL);
+			act->lex_env = duk_hobject_get_proto_raw(thr->heap, prev_env);
+			DUK_HOBJECT_INCREF_ALLOWNULL(thr, act->lex_env);
+			DUK_HOBJECT_DECREF_ALLOWNULL(thr, prev_env);
+			break;
+		}
+
+		case DUK_OP_CLONELEXENV: {
+			duk_activation *act;
+			duk_hdecenv *new_env;
+			duk_hobject *curr_env;
+			duk_hobject *parent_env;
+			duk_tval *tv1;
+			duk_hobject *h_bindings;
+			duk_uarridx_t i;
+			duk_uarridx_t n;
+			duk_idx_t env_idx;
+			duk_uint_t attrs;
+			duk_uint_t prop_flags;
+			duk_uint_t clone_flags;
+			duk_tval *tv_val;
+			duk_hstring *h_name;
+
+			act = thr->callstack_curr;
+			DUK_ASSERT(act != NULL);
+			curr_env = act->lex_env;
+			DUK_ASSERT(curr_env != NULL);
+			DUK_ASSERT(DUK_HOBJECT_IS_DECENV(curr_env));
+			clone_flags = (duk_uint_t) DUK_DEC_A(ins);
+
+			tv1 = DUK__CONSTP_BC(ins);
+			DUK_ASSERT(DUK_TVAL_IS_OBJECT(tv1));
+			h_bindings = DUK_TVAL_GET_OBJECT(tv1);
+			DUK_ASSERT(h_bindings != NULL);
+
+			new_env = duk_hdecenv_alloc(thr, DUK_HOBJECT_FLAG_EXTENSIBLE | DUK_HEAPHDR_HTYPE_AS_FLAGS(DUK_HTYPE_DECENV));
+			DUK_ASSERT(new_env != NULL);
+			duk_push_hobject(thr, (duk_hobject *) new_env);
+			env_idx = duk_get_top_index(thr);
+
+			duk_push_hobject(thr, h_bindings);
+			n = (duk_uarridx_t) duk_get_length(thr, -1);
+			for (i = 0; i < n; i += 2) {
+				duk_uint_t binding_flags;
+
+				duk_get_prop_index(thr, -1, i);
+				duk_get_prop_index(thr, -2, i + 1);
+				binding_flags = (duk_uint_t) duk_get_uint(thr, -1);
+				duk_pop_known(thr);
+				h_name = duk_known_hstring_m1(thr);
+				tv_val = duk_hobject_find_entry_tval_ptr_and_attrs(thr->heap, curr_env, h_name, &attrs);
+				DUK_ASSERT(tv_val != NULL);
+				if ((binding_flags & DUK_BC_BLOCK_FLAG_CONST) && (clone_flags & DUK_BC_CLONELEXENV_FLAG_RESET_CONST)) {
+					duk_push_undefined(thr);
+					DUK_TVAL_SET_UNUSED(DUK_GET_TVAL_NEGIDX(thr, -1));
+				} else {
+					duk_push_tval(thr, tv_val);
+				}
+				prop_flags = attrs & (DUK_PROPDESC_FLAG_WRITABLE | DUK_PROPDESC_FLAG_ENUMERABLE | DUK_PROPDESC_FLAG_CONST);
+				duk_xdef_prop(thr, env_idx, prop_flags);
+			}
+			duk_pop_known(thr);
+
+			parent_env = duk_hobject_get_proto_raw(thr->heap, curr_env);
+			duk_hobject_set_proto_raw(thr->heap, (duk_hobject *) new_env, parent_env);
+			DUK_HOBJECT_INCREF_ALLOWNULL(thr, parent_env);
+			act->lex_env = (duk_hobject *) new_env;
+			DUK_HOBJECT_INCREF(thr, (duk_hobject *) new_env);
+			DUK_HOBJECT_DECREF_ALLOWNULL(thr, curr_env);
+
+			duk_pop_known(thr);
+			break;
+		}
+
 		case DUK_OP_PUTVAR: {
 			duk_activation *act;
 			duk_tval *tv1;
@@ -5243,9 +5386,6 @@ restart_execution:
 #endif
 #endif
 		case DUK_OP_UNUSED207:
-		case DUK_OP_UNUSED212:
-		case DUK_OP_UNUSED213:
-		case DUK_OP_UNUSED214:
 		case DUK_OP_UNUSED215:
 		case DUK_OP_UNUSED216:
 		case DUK_OP_UNUSED217:

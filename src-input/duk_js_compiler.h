@@ -128,6 +128,9 @@ struct duk_compiler_func {
 	duk_hbuffer_dynamic *h_labelinfos; /* C array of duk_labelinfo */
 	duk_hobject *h_argnames; /* array of formal argument names (-> _Formals) */
 	duk_hobject *h_varmap; /* variable map for pass 2 (identifier -> register number or null (unmapped)) */
+	duk_hobject *h_blockscopes; /* array of block scope binding arrays */
+	duk_hobject *h_blockscope_stack; /* array of active block scope ids */
+	duk_hobject *h_blockscope_restore; /* array of varmap restore arrays */
 
 	/* Value stack indices for tracking objects. */
 	/* code_idx: not needed */
@@ -138,6 +141,9 @@ struct duk_compiler_func {
 	duk_idx_t labelinfos_idx;
 	duk_idx_t argnames_idx;
 	duk_idx_t varmap_idx;
+	duk_idx_t blockscopes_idx;
+	duk_idx_t blockscope_stack_idx;
+	duk_idx_t blockscope_restore_idx;
 
 	/* Temp reg handling. */
 	duk_regconst_t temp_first; /* first register that is a temporary (below: variables) */
@@ -159,6 +165,7 @@ struct duk_compiler_func {
 	/* Misc. */
 	duk_int_t stmt_next; /* statement id allocation (running counter) */
 	duk_int_t label_next; /* label id allocation (running counter) */
+	duk_uint_t block_next; /* block scope id allocation (running counter) */
 	duk_int_t catch_depth; /* catch stack depth */
 	duk_int_t with_depth; /* with stack depth (affects identifier lookups) */
 	duk_int_t fnum_next; /* inner function numbering */

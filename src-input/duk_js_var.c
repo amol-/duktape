@@ -1211,6 +1211,13 @@ duk_bool_t duk__getvar_helper(duk_hthread *thr, duk_hobject *env, duk_activation
 	parents = 1; /* follow parent chain */
 	if (duk__get_identifier_reference(thr, env, name, act, parents, &ref)) {
 		if (ref.value) {
+			if (DUK_UNLIKELY(DUK_TVAL_IS_UNUSED(ref.value))) {
+				DUK_ERROR_FMT1(thr,
+				               DUK_ERR_REFERENCE_ERROR,
+				               "identifier '%s' uninitialized",
+				               (const char *) duk_hstring_get_data(name));
+				DUK_WO_NORETURN(return 0;);
+			}
 			duk_push_tval(thr, ref.value);
 			duk_push_undefined(thr);
 		} else {
@@ -1332,6 +1339,17 @@ void duk__putvar_helper(duk_hthread *thr,
 	parents = 1; /* follow parent chain */
 
 	if (duk__get_identifier_reference(thr, env, name, act, parents, &ref)) {
+		if (ref.value && (ref.attrs & DUK_PROPDESC_FLAG_CONST)) {
+			if (DUK_LIKELY(DUK_TVAL_IS_UNUSED(ref.value))) {
+				DUK_TVAL_SET_TVAL_UPDREF(thr, ref.value, &tv_tmp_val); /* side effects */
+				return;
+			}
+			DUK_ERROR_FMT1(thr,
+			               DUK_ERR_TYPE_ERROR,
+			               "const assignment to '%s'",
+			               (const char *) duk_hstring_get_data(name));
+			DUK_WO_NORETURN(return;);
+		}
 		if (ref.value && (ref.attrs & DUK_PROPDESC_FLAG_WRITABLE)) {
 			/* Update duk_tval in-place if pointer provided and the
 			 * property is writable.  If the property is not writable
