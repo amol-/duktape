@@ -6,6 +6,8 @@ SyntaxError
 SyntaxError
 0 1 2
 3
+undefined
+ReferenceError
 1
 ===*/
 
@@ -50,6 +52,27 @@ SyntaxError
 	}
 	print(count);
 })();
+
+switch (1) {
+case 1:
+	let s = 1;
+	break;
+}
+print(typeof s);
+
+	try {
+		switch (1) {
+	case 1:
+		/* TDZ across cases. */
+		print(s2);
+		break;
+	case 2:
+		let s2 = 2;
+		break;
+		}
+} catch (e) {
+	print(e.name);
+}
 
 let z = 1;
 print(z);
